@@ -1,0 +1,343 @@
+/*
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ * 
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ * 
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
+ * MA 02110-1301, USA.
+ * 
+ */
+
+@name Toasty Hex Editor 1.0
+@inputs CS:wirelink DEVICE:wirelink
+@outputs Label:table
+# System variables
+@persist D:array Saddr:string CSColor SAddrOffset YOffset State:string Version:string BuildDate:string 
+# Variables for 'run'
+@persist  XOffset FirstLine CountLim Count X LineCount
+# Variables for 'write'
+@persist WriteBuffer:array WriteBufferLength WriteOffset WriteCount AsciiMode
+# Variables for 'save'
+@persist LocalSaveOffset RemoteSaveOffset SaveCount SaveCountLim
+# Variables for 'read'
+@persist LocalReadOffset RemoteReadOffset ReadCount ReadCountLim
+@trigger none
+interval(1)
+runOnChat(1)
+
+
+#[ --------------------------------------------------
+Hex editor by HalfBurntToast
+LOOP STATES:
+run    - showing hex dump (should be changed to 'dump')
+pause  - paused 'run' action
+write  - writing data from chat to output
+stop   - no action, waiting for chat command
+save   - saving to external device 
+read   - reading from external device
+
+FLAGS:
+AsciiMode - Reads or writes in ascii
+
+
+EDITOR COMMANDS (all numerical arguments are in hex!):
+>x X1 X2          - Dumps hex from memory address X1 to X2
+>xn X1 N          - Dumps N hex digits starting from address X1
+>xa X1 X2         - Same as '>x' but outputs ASCII only
+>xna X1 N         - Combines '>xn' and '>xa': outputs N ASCII characters starting from X1
+>w X1 D1 D2 D3... - Writes a variable number of hex bytes (D#) to memory starting at address X1
+>wa X1 S          - Writes a variable length ASCII string (S) to memory starting at address X1
+>q                - Ends any currently running task immediately
+>rst              - Soft-reset the device, does not erase internal memory
+>lclear           - Erases internal memory, cannot be undone!
+
+DEVICE ACCESS COMMANDS:
+>sv LO RO N       - Copies a data block from internal memory to the remote device 'DEVICE' (RAM, DHDD, etc.)
+					LO = Local Memory Offset
+					RO = Remote Memory Offset
+					N  = Copies N number of bytes
+					example: 
+						>sv 200 1F FF ; copies 256 bytes (N) from Local memory address 0x200 (LO)
+						              ; to Remote Memory address 0x1F (RO)
+>rd LO RO N       - Same as '>sv' but reads to internal memory. BE CAREFUL, the position of LO and RO 
+                    haven't changed! LO always comes first!
+>bsv LS LE RS
+>bsv RS RE LS
+--------------------------------------------------]#
+
+
+if(first()) {
+    # Header Definitions ---------------------------
+    function cs_scroll() {}
+    function cs_clear() {}
+    function cs_flip() {}
+    function check_chat() {}
+    function print_address(Address:number) {}
+    function print_byte(Byte:number, X:number) {}
+    function print_string(String:string) {}
+    function print_char(Char:string) {}
+    function print_help() {}
+    function sys_init() {}
+    # ----------------------------------------------
+    
+    # Function Definitions
+    function cs_scroll() { CS[2038] = 1 }
+    function cs_clear()  { CS[2041] = 1 }
+    function cs_flip() {
+        CS[2047] = 1
+        CS[2047] = 0
+    }
+    function check_chat() {
+        if(lastSpoke() == owner()) {
+            ControlChar = ">"
+            LastSaid = lastSaid()
+            ChatArray = LastSaid:explode(" ")
+            Cmd  = ChatArray[1, string]
+            Par1 = ChatArray[2, string]
+            Par2 = ChatArray[3, string]
+            Par3 = ChatArray[4, string]
+            if(Cmd[1] == ControlChar) {
+                hideChat(1)
+                print_string(LastSaid:upper())
+                Cmd = Cmd:sub(2, Cmd:length())
+                if(Cmd == "lclear") {
+                    D = array()
+                    print_string("All local memory cleared")
+                }
+                if(Cmd == "rst" | Cmd == "reset") {
+                    sys_init()
+                }
+                if(Cmd == "x" | Cmd == "show" | Cmd == "xa" | Cmd == "xn" | Cmd == "xna") {
+                    AsciiMode = 0
+                    if(Cmd == "xa" | Cmd == "xna") { AsciiMode = 1 }
+                    Count = Par1:toNumber(16)
+                    if(Cmd == "xn" | Cmd == "xna") {
+                        CountLim = bAnd(Count + Par2:toNumber(16), 0xFFFF)
+                    } else {
+                        CountLim = Par2:toNumber(16)
+                    }
+                    State = "run"
+                    FirstLine = 1
+                    LineCount = 0
+                }
+                if(Cmd == "w" | Cmd == "write" | Cmd == "wa") {
+                    AsciiMode = 0
+                    ChatArray:remove(1) # POP command
+                    ChatArray:remove(1) # POP first variable
+                    WriteBuffer = ChatArray
+                    if(Cmd == "wa") {
+                        AsciiMode = 1
+                        WriteBuffer = ChatArray:concat(" "):explode("")
+                    }
+                    WriteBufferLength = WriteBuffer:count()
+                    WriteOffset = Par1:toNumber(16)
+                    WriteCount = 0
+                    if(WriteBufferLength != 0) {
+                        State = "write"
+                    }
+                }
+                if(Cmd == "sv" | Cmd == "bsv") {
+                    if(Cmd == "sv") {
+                        LocalSaveOffset  = bAnd(Par1:toNumber(16), 0xFFFF)
+                        RemoteSaveOffset = bAnd(Par2:toNumber(16), 0xFFFF)
+                        SaveCountLim = bAnd(Par3:toNumber(16), 0xFFFF)
+                    } else {
+                        LocalSaveOffset  = bAnd(Par1:toNumber(16), 0xFFFF)
+                        RemoteSaveOffset = bAnd(Par3:toNumber(16), 0xFFFF)
+                        SaveCountLim = bAnd(Par2:toNumber(16), 0xFFFF) - bAnd(LocalSaveOffset, 0xFFFF)
+                    }
+                    SaveCount = 0
+                    print_string("Saving to device...")
+                    State = "save"
+                }
+                if(Cmd == "rd" | Cmd == "brd") {
+                    if(Cmd == "rd") {
+                        LocalReadOffset  = bAnd(Par1:toNumber(16), 0xFFFF)
+                        RemoteReadOffset = bAnd(Par2:toNumber(16), 0xFFFF)
+                        ReadCountLim = bAnd(Par3:toNumber(16), 0xFFFF)
+                    } else {
+                        RemoteReadOffset = bAnd(Par1:toNumber(16), 0xFFFF)
+                        LocalReadOffset  = bAnd(Par3:toNumber(16), 0xFFFF)
+                        ReadCountLim = bAnd(Par2:toNumber(16), 0xFFFF) - bAnd(RemoteReadOffset, 0xFFFF)
+                    }
+                    ReadCount = 0
+                    print_string("Reading from device...")
+                    State = "read"
+                }
+                if(Cmd == "halt" | Cmd == "stop" | Cmd == "q") {
+                    State = "stop"
+                }  
+                if(Cmd == "n" | Cmd == "next") {
+                    if(State == "pause") {
+                        LineCount = 0
+                        State = "run"
+                    }
+                }     
+                if(Cmd == "label") {
+                    local ParTemp = Par1:upper()
+                    Label[ParTemp, number] = Par2:toNumber(16)
+                    print_string(" $" + Par1:upper() + " -> " + format("0x%04X", Label[ParTemp, number]))
+                }
+                if(Cmd == "slabel") {
+                    local Keys = Label:keys()
+                    local Lim = Keys:count()
+                    for(I = 1, Lim, 1) {
+                        local CurKey = Keys[I, string]
+                        print_string(format("%8s : %04X", CurKey, Label[CurKey, number]))
+                    }
+                }
+                if(Cmd == "help" | Cmd == "h") {
+                    print_help()
+                }               
+            }              
+        }     
+    }
+    function print_address(Address:number) {
+        Temp = format("%04X:", Address)
+        CS:writeString(Temp, 0, YOffset, CSColor, 0, 0)
+    }
+    function print_byte(Byte:number, X:number) {
+        Temp = format("%02X", Byte)
+        CS:writeString(Temp, X, YOffset, CSColor, 0, 0)
+    }
+    function print_char(Char:string, X:number) {
+        if(Char == "") { Char = "." }
+        CS:writeString(Char, X, YOffset, CSColor, 0, 0)
+    }
+    function print_string(String:string) {
+        cs_scroll()
+        CS:writeString(String, 0, YOffset, CSColor, 0, 0)
+        cs_flip()
+    }
+    function print_help() {
+        cs_clear()
+        print_string("Hex Editor by HalfBurntToast")
+        print_string("  " + Version + " - " + BuildDate)
+        print_string("(X = hex address - S = string)")
+        cs_scroll()
+        print_string(">x X1 X2  - hexdump X1-X2")   
+        print_string(">xn X1 N  - dump N bytes")
+        print_string(">xa X1 X2 - ASCII dump X1-X2")
+        print_string(">xna X1 N - dump N ascii bytes") 
+        print_string(">w X1 D1 D2... Write D# to X1")
+        print_string(">wa X1 S  - Write S to X1*")
+        print_string(">q        - Stop cur. process")
+        print_string(">rst      - Reset")
+        print_string(">lclear   - Reset local mem")
+        print_string(">sv LO RO N - save to device*")
+        print_string(">rd LO RO N - read from device*")
+        print_string("*See comments for more details")
+    }
+    function sys_init() {
+        cs_clear()
+        Label = table()
+        AsciiMode = 0
+        Count = 0
+        CountLim = 0
+        SAddrOffset = 6
+        YOffset = 17
+        CSColor = 90
+        WriteCount = 0
+        WriteBufferLength = 0
+        LineCount = 0
+        State = "stop"
+        Version = "1.0"
+        BuildDate = "JUN/8/2014"
+        print_string(" Hex Editor by HalfBurntToast")
+        print_string("        >h for help")
+    }
+    
+    # Call reset on spawn
+    sys_init()
+}
+
+
+# Main loop tree (auto regulates ops)
+# the parameters for these loops are set in the chat parser
+if(!first() & (ops() < minquota())) {
+    # Hexdump loop
+    # If AsciiMode == 1, output ASCII only
+    if(State == "run") {
+        
+        # If the current line is a multiple of 8, go to new line and reset XOffSet
+        if(Count % 0x8 == 0 | FirstLine == 1) {
+            cs_flip()
+            cs_scroll()
+            print_address(Count)
+            XOffset = SAddrOffset
+            FirstLine = 0
+            LineCount++
+        }
+        
+        # Fetch and print a single byte from memory, increment the XOffset afterwards
+        if(AsciiMode == 0) {
+            print_byte(D[Count, number], XOffset)
+            XOffset += 3
+        } else {
+            print_char(toChar(D[Count, number]), XOffset)
+            XOffset += 1
+        }
+        
+        Count += 1
+        
+        # break if limit has been reached
+        if(Count > CountLim) {
+            cs_flip() # print last line
+            State = "stop"
+        }
+        # Pause after writing 15 lines
+        if(LineCount == 17 & Count % 8 == 0 & State != "stop") {
+            print_string(" >n to continue - >q to stop")
+            State = "pause"
+        }
+    }
+    
+    # Write loop
+    # if AsciiMode == 1, store ASCII bytes from string into memory
+    if(State == "write") {
+        Address = WriteOffset + WriteCount
+        if(AsciiMode == 0) {
+            D[Address, number] = bAnd(WriteBuffer[WriteCount + 1, string]:toNumber(16), 0xFF)
+        } else {
+            D[Address, number] = toByte(WriteBuffer[WriteCount + 1, string])
+        }
+        WriteCount += 1
+        if(WriteCount >= WriteBufferLength) {
+            print_string(format(" %04X bytes written", WriteCount))
+            State = "stop"
+        }
+    }
+    
+    # Save loop
+    if(State == "save") {
+        DEVICE[RemoteSaveOffset + SaveCount] = D[LocalSaveOffset + SaveCount, number]
+        SaveCount++
+        if(SaveCount > SaveCountLim) {
+            print_string(format("%04X bytes written to device", SaveCount))
+            State = "stop"
+        }
+    }
+    
+    # Read loop
+    if(State == "read") {
+        D[LocalReadOffset + ReadCount, number] = DEVICE[RemoteReadOffset + ReadCount]
+        ReadCount++
+        if(ReadCount > ReadCountLim) {
+            print_string(format("%04X bytes read from device", ReadCount))
+            State = "stop"
+        }
+    }
+}
+
+# Parse chat commands
+if(chatClk()) {
+    check_chat()
+}
